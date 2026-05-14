@@ -1,0 +1,139 @@
+{
+  "title": "Recharge Sync to Meter — SLA Monitoring",
+  "uid": "sla-recharge-sync",
+  "schemaVersion": 38,
+  "refresh": "5m",
+  "time": { "from": "now-6h", "to": "now" },
+  "timezone": "browser",
+  "templating": {
+    "list": [
+      {
+        "name": "from_date",
+        "type": "textbox",
+        "label": "From Date",
+        "current": { "value": "2026-05-11" }
+      },
+      {
+        "name": "to_date",
+        "type": "textbox",
+        "label": "To Date",
+        "current": { "value": "2026-05-12" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "SLA Compliance: 30 Minutes (Target: ≥90%)",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "auto" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 80 },
+              { "color": "green", "value": 90 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "datasource": "db_prepaid_engine",
+          "rawSql": "SELECT 100.0 * COUNT(*) FILTER (WHERE sla_30min_met) / NULLIF(COUNT(*), 0) AS value FROM sla_results WHERE recharge_created_at >= '$from_date 00:00:00+05:30' AND recharge_created_at < '$to_date 00:00:00+05:30'",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "SLA Compliance: 60 Minutes (Target: ≥99%)",
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "auto" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 95 },
+              { "color": "green", "value": 99 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "datasource": "db_prepaid_engine",
+          "rawSql": "SELECT 100.0 * COUNT(*) FILTER (WHERE sla_60min_met) / NULLIF(COUNT(*), 0) AS value FROM sla_results WHERE recharge_created_at >= '$from_date 00:00:00+05:30' AND recharge_created_at < '$to_date 00:00:00+05:30'",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "SLA Compliance Trend (hourly)",
+      "gridPos": { "x": 0, "y": 4, "w": 24, "h": 8 },
+      "targets": [
+        {
+          "datasource": "db_prepaid_engine",
+          "rawSql": "SELECT date_trunc('hour', recharge_created_at) AS time, 100.0 * COUNT(*) FILTER (WHERE sla_30min_met) / NULLIF(COUNT(*), 0) AS \"30-min SLA %\", 100.0 * COUNT(*) FILTER (WHERE sla_60min_met) / NULLIF(COUNT(*), 0) AS \"60-min SLA %\" FROM sla_results WHERE recharge_created_at >= '$from_date 00:00:00+05:30' AND recharge_created_at < '$to_date 00:00:00+05:30' GROUP BY 1 ORDER BY 1",
+          "format": "time_series"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percent", "min": 0, "max": 100 },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "30-min SLA %" }, "properties": [{ "id": "custom.lineStyle", "value": { "dash": [10, 10] } }] }
+        ]
+      }
+    },
+    {
+      "id": 4,
+      "type": "barchart",
+      "title": "Breach Distribution by Type",
+      "gridPos": { "x": 0, "y": 12, "w": 8, "h": 6 },
+      "targets": [
+        {
+          "datasource": "db_prepaid_engine",
+          "rawSql": "SELECT breach_reason, COUNT(*) AS count FROM sla_results WHERE recharge_created_at >= '$from_date 00:00:00+05:30' AND recharge_created_at < '$to_date 00:00:00+05:30' AND NOT sla_60min_met GROUP BY breach_reason ORDER BY count DESC",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "US SET CURRENT BALANCE AMOUNT: Success vs Failure",
+      "gridPos": { "x": 8, "y": 12, "w": 8, "h": 6 },
+      "targets": [
+        {
+          "datasource": "db_prepaid_engine",
+          "rawSql": "SELECT balance_cmd_status AS metric, COUNT(*) AS value FROM sla_results WHERE recharge_created_at >= '$from_date 00:00:00+05:30' AND recharge_created_at < '$to_date 00:00:00+05:30' GROUP BY balance_cmd_status",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "table",
+      "title": "SLA Breached Meters",
+      "gridPos": { "x": 0, "y": 18, "w": 24, "h": 10 },
+      "options": { "sortBy": [{ "displayName": "elapsed_seconds", "desc": true }] },
+      "targets": [
+        {
+          "datasource": "db_prepaid_engine",
+          "rawSql": "SELECT transaction_id, meter_number, account_id, amount, recharge_created_at, resolved_sync_ts, elapsed_seconds, breach_reason, balance_cmd_status FROM sla_results WHERE recharge_created_at >= '$from_date 00:00:00+05:30' AND recharge_created_at < '$to_date 00:00:00+05:30' AND NOT sla_60min_met ORDER BY elapsed_seconds DESC NULLS FIRST",
+          "format": "table"
+        }
+      ]
+    }
+  ]
+}
