@@ -89,7 +89,17 @@ def process_date(date_str: str, p_conn, m_conn, h_conn, ldp_map: dict):
                 continue
 
             from src.validator import is_meter_communicating
-            if not is_meter_communicating(recharge["meter_number"], recharge["created_at"], ldp_map):
+            ok, detail = is_meter_communicating(recharge["meter_number"], recharge["created_at"], ldp_map)
+            if not ok:
+                import sys
+                print(
+                    f"  [non-comm] meter={recharge['meter_number']} "
+                    f"com_type={detail['com_type']} "
+                    f"effective_ldp={detail['effective_ldp']} "
+                    f"gap={detail['gap_days']}d | {detail['reason']}",
+                    flush=True,
+                    file=sys.stderr,
+                )
                 date_stats["skipped_non_comm"] += 1
                 continue
 

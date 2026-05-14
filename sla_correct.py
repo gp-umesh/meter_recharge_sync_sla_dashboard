@@ -111,11 +111,17 @@ def main():
             skipped_no_eligible += 1
             continue
 
-        # Skip if meter was not communicating at recharge time (meter_ldp < recharge.created_at)
-        if not is_meter_communicating(recharge['meter_number'], recharge['created_at'], ldp_map):
+        # Skip if meter was not communicating at recharge time
+        ok, detail = is_meter_communicating(recharge['meter_number'], recharge['created_at'], ldp_map)
+        if not ok:
             print(
-                f"[SLA Correct] SKIP {recharge['meter_number']} (TXN {recharge['transaction_id']}): "
-                f"meter non-communicating at recharge time",
+                f"[SLA Correct] SKIP non-comm | meter={recharge['meter_number']} "
+                f"txn={recharge['transaction_id']} "
+                f"com_type={detail['com_type']} "
+                f"meter_ldp={detail['meter_ldp']} "
+                f"dcu_ldp={detail['dcu_ldp']} "
+                f"recharge={recharge['created_at'].strftime('%Y-%m-%d %H:%M:%S')} "
+                f"| {detail['reason']}",
                 file=sys.stderr,
             )
             skipped_non_communicating += 1
