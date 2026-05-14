@@ -8,4 +8,6 @@ SELECT
 FROM recharges_data
 WHERE created_at >= %(from_date)s
   AND created_at <  %(to_date)s
-ORDER BY created_at;
+ORDER BY created_at
+LIMIT  %(limit)s
+OFFSET %(offset)s;

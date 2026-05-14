@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""SLA correction script — updates MDMS and HES timestamps for US SET CURRENT BALANCE AMOUNT."""
+"""SLA correction script — updates MDMS and HES records for SLA-breached recharges."""
 import argparse
 import os
 import sys
 
+import psycopg2
 from dotenv import load_dotenv
 from tabulate import tabulate
 
@@ -21,8 +22,10 @@ def _check_env():
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Update executionStartTime/executionEndTime/executionStatus for "
-            "'US SET CURRENT BALANCE AMOUNT' in MDMS and HES for SLA-breached recharges."
+            "Correct SLA-breached recharges by updating timestamps and status in MDMS and HES.\n"
+            "Randomly selects one eligible command per recharge to mark SUCCESS.\n"
+            "Sets createdAt and executionStartTime = recharge.created_at for ALL 5 commands.\n"
+            "Updates cmd_exec_response_data and command_execution_responses for the selected command."
         ),
         epilog=(
             "Environment variables required:\n"
@@ -30,9 +33,9 @@ def main():
             "  DB_MDMS_URL     PostgreSQL URL for db_cmd_exec (MDMS)\n"
             "  DB_HES_URL      PostgreSQL URL for HES routing service\n\n"
             "Examples:\n"
-            "  python sla_correct.py --date 2026-05-11                       # dry-run (safe default)\n"
-            "  python sla_correct.py --date 2026-05-11 --no-dry-run          # apply corrections\n"
-            "  python sla_correct.py --date 2026-05-11 --target-seconds 900  # 15-min target\n"
+            "  python sla_correct.py --date 2026-05-12                       # dry-run (safe default)\n"
+            "  python sla_correct.py --date 2026-05-12 --no-dry-run          # apply corrections\n"
+            "  python sla_correct.py --date 2026-05-12 --target-seconds 900  # 15-min target\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -48,12 +51,13 @@ def main():
         sys.exit(1)
 
     dry_run = not args.no_dry_run
-
     _check_env()
 
     from src.db import prepaid_conn, mdms_conn, hes_conn
     from src.queries import fetch_recharges, fetch_mdms_commands, fetch_hes_executions
-    from src.corrector import apply_correction
+    from src.sla_engine import resolve_sync_timestamp
+    from src.corrector import apply_correction, select_eligible_command
+    from src.validator import validation_conn, fetch_meter_ldp_map, is_meter_communicating
 
     try:
         with prepaid_conn() as p_conn:
@@ -75,26 +79,60 @@ def main():
         print(f"[SLA Correct] ERROR: Cannot connect to MDMS DB: {exc}", file=sys.stderr)
         sys.exit(2)
 
-    # Collect all US SET CURRENT BALANCE AMOUNT commands that need correction
+    # Batch-fetch meter communication status (one query for all meters in the date)
+    try:
+        val_conn = validation_conn(os.environ["DB_MDMS_URL"])
+        all_meter_serials = list({r["meter_number"] for r in recharges})
+        ldp_map = fetch_meter_ldp_map(all_meter_serials, val_conn)
+        val_conn.close()
+    except Exception as exc:
+        print(f"[SLA Correct] ERROR: Cannot connect to validation_rules DB: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    # Identify breached recharges that have at least one eligible command
     candidates = []
+    skipped_compliant = 0
+    skipped_no_eligible = 0
+    skipped_non_communicating = 0
+
     for recharge in recharges:
         cmds = commands_by_account.get(recharge["account_id"], [])
-        for cmd in cmds:
-            if cmd.get("commandName") != "US SET CURRENT BALANCE AMOUNT":
+        resolved_ts, breach_reason = resolve_sync_timestamp(cmds)
+
+        # Skip if already within target SLA window (idempotent)
+        if resolved_ts is not None:
+            elapsed = (resolved_ts - recharge["created_at"]).total_seconds()
+            if elapsed <= args.target_seconds:
+                skipped_compliant += 1
                 continue
-            exec_id = str(cmd.get("hes_execution_id", ""))
-            already_ok = (
-                cmd.get("executionStatus") == "SUCCESS"
-                and cmd.get("mdm_end") is not None
+
+        # Skip if no eligible command available to make SUCCESS
+        if select_eligible_command(cmds, seed=recharge['transaction_id']) is None:
+            skipped_no_eligible += 1
+            continue
+
+        # Skip if meter was not communicating at recharge time (meter_ldp < recharge.created_at)
+        if not is_meter_communicating(recharge['meter_number'], recharge['created_at'], ldp_map):
+            print(
+                f"[SLA Correct] SKIP {recharge['meter_number']} (TXN {recharge['transaction_id']}): "
+                f"meter non-communicating at recharge time",
+                file=sys.stderr,
             )
-            if already_ok:
-                delta = (cmd["mdm_end"] - recharge["created_at"]).total_seconds()
-                if delta <= args.target_seconds:
-                    continue  # already within target — skip (idempotent)
-            candidates.append((recharge, cmd, exec_id))
+            skipped_non_communicating += 1
+            continue
 
-    all_exec_ids = [exec_id for _, _, exec_id in candidates]
+        candidates.append((recharge, cmds))
 
+    if not candidates:
+        print(f"[SLA Correct] No corrections needed for {args.date}", file=sys.stderr)
+        sys.exit(0)
+
+    # Fetch HES records for all execution IDs across all candidate recharges
+    all_exec_ids = [
+        str(cmd["hes_execution_id"])
+        for recharge, cmds in candidates
+        for cmd in cmds
+    ]
     try:
         with hes_conn() as h_conn_read:
             hes_records = fetch_hes_executions(all_exec_ids, h_conn_read)
@@ -103,52 +141,73 @@ def main():
         sys.exit(2)
 
     corrections = []
-    skipped = 0
+    skipped_missing_hes = 0
 
     if dry_run:
-        for recharge, cmd, exec_id in candidates:
-            if exec_id not in hes_records:
-                print(f"[SLA Correct] WARN: execution_id {exec_id} not found in HES — skipping", file=sys.stderr)
-                skipped += 1
-                continue
-            result = apply_correction(exec_id, recharge["created_at"], None, None,
+        for recharge, cmds in candidates:
+            result = apply_correction(recharge, cmds, None, None,
                                       args.target_seconds, dry_run=True)
-            result["meter_number"] = recharge["meter_number"]
-            result["account_id"] = recharge["account_id"]
-            corrections.append(result)
+            if result:
+                selected_id = result['selected_execution_id']
+                if selected_id not in hes_records:
+                    print(f"[SLA Correct] WARN: execution_id {selected_id} not in HES — would skip",
+                          file=sys.stderr)
+                    skipped_missing_hes += 1
+                    continue
+                corrections.append(result)
     else:
         try:
-            m_conn = __import__("psycopg2").connect(os.environ["DB_MDMS_URL"])
-            h_conn = __import__("psycopg2").connect(os.environ["DB_HES_URL"])
+            m_conn = psycopg2.connect(os.environ["DB_MDMS_URL"])
+            h_conn = psycopg2.connect(os.environ["DB_HES_URL"])
         except Exception as exc:
             print(f"[SLA Correct] ERROR: DB connection failed: {exc}", file=sys.stderr)
             sys.exit(2)
 
-        for recharge, cmd, exec_id in candidates:
-            if exec_id not in hes_records:
-                print(f"[SLA Correct] WARN: execution_id {exec_id} not found in HES — skipping", file=sys.stderr)
-                skipped += 1
-                continue
-            result = apply_correction(exec_id, recharge["created_at"], m_conn, h_conn,
+        for recharge, cmds in candidates:
+            result = apply_correction(recharge, cmds, m_conn, h_conn,
                                       args.target_seconds, dry_run=False)
-            result["meter_number"] = recharge["meter_number"]
-            result["account_id"] = recharge["account_id"]
+            if result is None:
+                continue
+            selected_id = result['selected_execution_id']
+            if selected_id not in hes_records:
+                print(f"[SLA Correct] WARN: execution_id {selected_id} not found in HES — skipped",
+                      file=sys.stderr)
+                skipped_missing_hes += 1
+                continue
             corrections.append(result)
 
+        # Commit once after all corrections (not per-correction)
+        m_conn.commit()
+        h_conn.commit()
         m_conn.close()
         h_conn.close()
 
     if corrections:
-        headers = ["execution_id", "meter_number", "account_id", "new_start_time", "new_end_time",
-                   "rows_updated_mdms", "rows_updated_hes"]
-        rows = [[c.get(h, "") for h in headers] for c in corrections]
+        headers = [
+            "transaction_id", "meter_number", "selected_command",
+            "selected_execution_id", "new_end_time",
+            "cmds_ts_updated", "mdms_success", "mdms_response",
+            "hes_cmd", "hes_response",
+        ]
+        rows = [
+            [
+                c["transaction_id"], c["meter_number"], c["selected_command"],
+                c["selected_execution_id"], c["new_end_time"],
+                c["commands_timestamp_updated"], c["rows_mdms_success"],
+                c["rows_mdms_response"], c["rows_hes_cmd"], c["rows_hes_response"],
+            ]
+            for c in corrections
+        ]
         print(tabulate(rows, headers=headers, tablefmt="simple"))
 
     mode_label = "DRY RUN — no changes written" if dry_run else "APPLIED"
-    print(f"\n[SLA Correct] Date: {args.date}  Mode: {mode_label}", file=sys.stderr)
-    print(f"[SLA Correct] Candidates found : {len(candidates)}", file=sys.stderr)
-    print(f"[SLA Correct] Corrected        : {len(corrections)}", file=sys.stderr)
-    print(f"[SLA Correct] Skipped (missing): {skipped}", file=sys.stderr)
+    print(f"\n[SLA Correct] Date          : {args.date}  Mode: {mode_label}", file=sys.stderr)
+    print(f"[SLA Correct] Total recharges: {len(recharges)}", file=sys.stderr)
+    print(f"[SLA Correct] Corrected      : {len(corrections)}", file=sys.stderr)
+    print(f"[SLA Correct] Skipped (compliant)      : {skipped_compliant}", file=sys.stderr)
+    print(f"[SLA Correct] Skipped (no eligible)    : {skipped_no_eligible}", file=sys.stderr)
+    print(f"[SLA Correct] Skipped (non-communicating): {skipped_non_communicating}", file=sys.stderr)
+    print(f"[SLA Correct] Skipped (missing HES)    : {skipped_missing_hes}", file=sys.stderr)
     if dry_run:
         print("[SLA Correct] Run with --no-dry-run to apply corrections.", file=sys.stderr)
 
