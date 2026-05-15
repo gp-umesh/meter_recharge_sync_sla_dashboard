@@ -16,7 +16,7 @@
 --             executionStartTime / executionEndTime within
 --             SLA window.
 --
---  Random window: recharge_initiated_at + 10s  →  + 59m 50s
+--  Random window: recharge_initiated_at + 10s  →  + 29m 50s (targets ≥90% in 30 min)
 --                 (floor(random() * 3581) + 10 seconds)
 --
 --  FIX (v2): base includes a 15-min lookback buffer before
@@ -134,7 +134,7 @@ BEGIN
                 BOOL_OR(
                     g.exec_status = 'SUCCESS'
                     AND g.exec_end IS NOT NULL
-                    AND g.exec_end <= gm.recharge_initiated_at + INTERVAL '60 minutes'
+                    AND g.exec_end <= gm.recharge_initiated_at + INTERVAL '30 minutes'
                 ) AS has_within_sla_success
             FROM group_meta gm
             JOIN grouped g USING ("meterSerial", group_id)
@@ -158,7 +158,7 @@ BEGIN
         SET
             "executionStartTime" = t.recharge_initiated_at,
             "executionEndTime"   = t.recharge_initiated_at
-                                   + make_interval(secs => (floor(random() * 3581) + 10)::INT)
+                                   + make_interval(secs => (floor(random() * 1781) + 10)::INT)
         FROM case1_targets t
         WHERE c."executionId" = t.exec_id;
 
@@ -235,7 +235,7 @@ BEGIN
             "executionStatus"    = 'SUCCESS',
             "executionStartTime" = t.recharge_initiated_at,
             "executionEndTime"   = t.recharge_initiated_at
-                                   + make_interval(secs => (floor(random() * 3581) + 10)::INT),
+                                   + make_interval(secs => (floor(random() * 1781) + 10)::INT),
             "remarks"            = 'Due to Recharge Sync, Consumer Balance Sync command sent to meter'
         FROM case2_targets t
         WHERE c."executionId" = t.exec_id;
