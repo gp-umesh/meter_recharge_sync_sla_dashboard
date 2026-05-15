@@ -12,24 +12,43 @@ def _load_sql(name: str) -> str:
     return (_SQL_DIR / name).read_text()
 
 
-def count_recharges(date: str, conn) -> int:
+def count_recharges(date: str, conn, meter_serials: list[str] | None = None) -> int:
     from_date = f"{date} 00:00:00+05:30"
     to_date   = f"{date} 23:59:59.999999+05:30"
     with conn.cursor() as cur:
-        cur.execute(
-            "SELECT COUNT(*) FROM recharges_data WHERE created_at >= %s AND created_at < %s",
-            (from_date, to_date),
-        )
+        if meter_serials:
+            cur.execute(
+                "SELECT COUNT(*) FROM recharges_data "
+                "WHERE created_at >= %s AND created_at < %s AND meter_number = ANY(%s)",
+                (from_date, to_date, meter_serials),
+            )
+        else:
+            cur.execute(
+                "SELECT COUNT(*) FROM recharges_data WHERE created_at >= %s AND created_at < %s",
+                (from_date, to_date),
+            )
         return cur.fetchone()[0]
 
 
-def fetch_recharges(date: str, conn, limit: int = 10000, offset: int = 0) -> list[dict]:
+def fetch_recharges(
+    date: str,
+    conn,
+    limit: int = 10000,
+    offset: int = 0,
+    meter_serials: list[str] | None = None,
+) -> list[dict]:
     from_date = f"{date} 00:00:00+05:30"
     to_date   = f"{date} 23:59:59.999999+05:30"
-    sql = _load_sql("query_recharges.sql")
+    if meter_serials:
+        sql    = _load_sql("query_recharges_filtered.sql")
+        params = {"from_date": from_date, "to_date": to_date,
+                  "limit": limit, "offset": offset, "meter_serials": meter_serials}
+    else:
+        sql    = _load_sql("query_recharges.sql")
+        params = {"from_date": from_date, "to_date": to_date,
+                  "limit": limit, "offset": offset}
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(sql, {"from_date": from_date, "to_date": to_date,
-                          "limit": limit, "offset": offset})
+        cur.execute(sql, params)
         return [dict(row) for row in cur.fetchall()]
 
 

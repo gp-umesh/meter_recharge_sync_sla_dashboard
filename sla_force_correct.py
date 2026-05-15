@@ -7,12 +7,15 @@ Differences from sla_correct.py:
   - All 5 MDMS commands are eligible for random selection
   - Default target is 3600 s (60 min); corrects only recharges that breach this threshold
   - Supports a single --date or a date range via --from-date / --to-date
+  - Optional --sat-table to restrict processing to meters in a named table in db_cmd_exec
   - Processes in batches of BATCH_SIZE to avoid memory issues on large dates
 
 Usage:
-  python sla_force_correct.py --date 2026-05-12                     # dry-run
-  python sla_force_correct.py --date 2026-05-12 --no-dry-run        # apply
+  python sla_force_correct.py --date 2026-05-12                                      # dry-run, all meters
+  python sla_force_correct.py --date 2026-05-12 --no-dry-run                         # apply, all meters
   python sla_force_correct.py --from-date 2026-04-15 --to-date 2026-05-14 --no-dry-run
+  python sla_force_correct.py --from-date 2026-04-15 --to-date 2026-05-14 \\
+      --sat-table sat_12 --no-dry-run                                                 # only sat_12 meters
 """
 import math
 import os
@@ -44,12 +47,31 @@ def _check_env():
         sys.exit(1)
 
 
-def _process_date(date_str: str, p_conn, m_conn, h_conn, target_seconds: int, dry_run: bool) -> dict:
+def _fetch_sat_meters(table_name: str, mdms_url: str) -> list[str]:
+    """Fetch meter_serial list from a named table in db_cmd_exec (MDMS DB)."""
+    conn = psycopg2.connect(mdms_url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f'SELECT meter_serial FROM {table_name}')
+            return [row[0] for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def _process_date(
+    date_str: str,
+    p_conn,
+    m_conn,
+    h_conn,
+    target_seconds: int,
+    dry_run: bool,
+    meter_serials: list[str] | None,
+) -> dict:
     from src.queries import count_recharges, fetch_recharges, fetch_mdms_commands, fetch_hes_executions
     from src.sla_engine import resolve_sync_timestamp
     from src.corrector import apply_correction
 
-    total = count_recharges(date_str, p_conn)
+    total = count_recharges(date_str, p_conn, meter_serials=meter_serials)
     if total == 0:
         print(f"  No recharges — skipping", flush=True)
         return dict(corrected=0, skipped_compliant=0, skipped_no_cmd=0, skipped_hes=0)
@@ -61,7 +83,9 @@ def _process_date(date_str: str, p_conn, m_conn, h_conn, target_seconds: int, dr
 
     for batch_num in range(n_batches):
         offset = batch_num * BATCH_SIZE
-        recharges = fetch_recharges(date_str, p_conn, limit=BATCH_SIZE, offset=offset)
+        recharges = fetch_recharges(
+            date_str, p_conn, limit=BATCH_SIZE, offset=offset, meter_serials=meter_serials
+        )
         if not recharges:
             break
 
@@ -131,17 +155,23 @@ def main():
             "  python sla_force_correct.py --date 2026-05-12\n"
             "  python sla_force_correct.py --date 2026-05-12 --no-dry-run\n"
             "  python sla_force_correct.py --from-date 2026-04-15 --to-date 2026-05-14 --no-dry-run\n"
+            "  python sla_force_correct.py --from-date 2026-04-15 --to-date 2026-05-14 \\\n"
+            "      --sat-table sat_12 --no-dry-run\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     date_group = parser.add_mutually_exclusive_group(required=True)
     date_group.add_argument("--date", help="Single date (YYYY-MM-DD)")
     date_group.add_argument("--from-date", help="Start date of range (YYYY-MM-DD)")
-    parser.add_argument("--to-date", help="End date of range inclusive (YYYY-MM-DD). Required with --from-date.")
+    parser.add_argument("--to-date",
+                        help="End date of range inclusive (YYYY-MM-DD). Required with --from-date.")
     parser.add_argument("--no-dry-run", action="store_true",
                         help="Apply corrections to DB (default is dry-run only)")
     parser.add_argument("--target-seconds", type=int, default=3600,
                         help="SLA window in seconds — correct recharges exceeding this (default: 3600 = 60 min)")
+    parser.add_argument("--sat-table", default=None,
+                        help="Table name in db_cmd_exec whose meter_serial column defines the meter filter "
+                             "(e.g. sat_12). Omit to process all meters.")
     args = parser.parse_args()
 
     if args.from_date and not args.to_date:
@@ -160,10 +190,25 @@ def main():
     dry_run = not args.no_dry_run
     _check_env()
 
+    # Fetch meter serial filter from sat table if requested
+    meter_serials = None
+    if args.sat_table:
+        print(f"[Force Correct] Fetching meters from {args.sat_table} in db_cmd_exec ...", flush=True)
+        try:
+            meter_serials = _fetch_sat_meters(args.sat_table, os.environ["DB_MDMS_URL"])
+        except Exception as exc:
+            print(f"[Force Correct] ERROR fetching {args.sat_table}: {exc}", file=sys.stderr)
+            sys.exit(2)
+        if not meter_serials:
+            print(f"[Force Correct] ERROR: {args.sat_table} is empty — nothing to process", file=sys.stderr)
+            sys.exit(3)
+        print(f"[Force Correct] Meter filter: {len(meter_serials):,} meters from {args.sat_table}", flush=True)
+
     mode = "DRY RUN — no changes written" if dry_run else "APPLY"
+    filter_label = f"sat_table={args.sat_table} ({len(meter_serials):,} meters)" if meter_serials else "all meters"
     print(
         f"[Force Correct] Mode={mode} | target={args.target_seconds}s ({args.target_seconds//60} min) "
-        f"| {len(dates)} date(s) | all 5 commands eligible | no LDP check\n",
+        f"| {len(dates)} date(s) | {filter_label} | all 5 commands eligible | no LDP check\n",
         flush=True,
     )
 
@@ -177,7 +222,10 @@ def main():
             m_conn = psycopg2.connect(os.environ["DB_MDMS_URL"])
             h_conn = psycopg2.connect(os.environ["DB_HES_URL"])
 
-            stats = _process_date(date_str, p_conn, m_conn, h_conn, args.target_seconds, dry_run)
+            stats = _process_date(
+                date_str, p_conn, m_conn, h_conn,
+                args.target_seconds, dry_run, meter_serials,
+            )
             for k, v in stats.items():
                 totals[k] += v
 
