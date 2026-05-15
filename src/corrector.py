@@ -18,8 +18,13 @@ def _load_sql(name: str) -> str:
     return (_SQL_DIR / name).read_text()
 
 
-def select_eligible_command(commands: list[dict], seed: str) -> dict | None:
-    eligible = [c for c in commands if c.get('commandName') in ELIGIBLE_COMMANDS]
+def select_eligible_command(
+    commands: list[dict],
+    seed: str,
+    eligible_command_names: list[str] | None = None,
+) -> dict | None:
+    names = eligible_command_names if eligible_command_names is not None else ELIGIBLE_COMMANDS
+    eligible = [c for c in commands if c.get('commandName') in names]
     if not eligible:
         return None
     return random.Random(seed).choice(eligible)
@@ -81,8 +86,10 @@ def apply_correction(
     hes_conn,
     target_elapsed_seconds: int = 1200,
     dry_run: bool = True,
+    eligible_command_names: list[str] | None = None,
 ) -> dict | None:
-    selected = select_eligible_command(commands, seed=recharge['transaction_id'])
+    selected = select_eligible_command(commands, seed=recharge['transaction_id'],
+                                       eligible_command_names=eligible_command_names)
     if selected is None:
         return None
 
