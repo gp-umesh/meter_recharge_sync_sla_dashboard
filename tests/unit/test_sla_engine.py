@@ -72,9 +72,9 @@ class TestResolveSync:
         assert reason == "PARTIAL_SUCCESS"
         assert resolved == ts(10)
 
-    def test_empty_commands_is_all_failed(self):
+    def test_empty_commands_is_no_command(self):
         resolved, reason = resolve_sync_timestamp([])
-        assert reason == "ALL_FAILED"
+        assert reason == "NO_COMMAND"
         assert resolved is None
 
 

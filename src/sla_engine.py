@@ -2,6 +2,8 @@ from datetime import datetime
 
 
 def resolve_sync_timestamp(commands: list[dict]) -> tuple[datetime | None, str]:
+    if not commands:
+        return None, "NO_COMMAND"
     successful = [
         c for c in commands
         if c.get("executionStatus") == "SUCCESS" and c.get("mdm_end") is not None
