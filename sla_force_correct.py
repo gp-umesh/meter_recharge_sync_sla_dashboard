@@ -67,6 +67,7 @@ def _process_date(
     dry_run: bool,
     meter_serials: list[str] | None,
     create_missing_hes: bool = False,
+    skip_retry_cleanup: bool = False,
 ) -> dict:
     from src.queries import (
         count_recharges, fetch_recharges, fetch_meter_numbers_for_date,
@@ -133,6 +134,7 @@ def _process_date(
                 dry_run=dry_run,
                 eligible_command_names=ALL_5_COMMANDS,
                 create_missing_hes=create_missing_hes,
+                skip_retry_cleanup=skip_retry_cleanup,
             )
             if result is None:
                 stats["skipped_no_cmd"] += 1
@@ -197,6 +199,13 @@ def main():
                              "command_info lookups) and backfill the MDMS executionId, then correct as usual. "
                              "Meters/commands that can't be resolved (not in device_info, or no matching "
                              "command_info for their protocol) are still skipped, not guessed at.")
+    parser.add_argument("--skip-retry-cleanup", action="store_true",
+                         help="Skip deleting stale FAILED HES retry rows after a correction. "
+                              "command_execution_info's own AFTER DELETE trigger does an unindexed, "
+                              "unbounded scan (~409M rows) when a deleted retry is the sole reference to "
+                              "its metadata row, which can turn a single delete into a multi-minute stall. "
+                              "With this flag, corrections still apply — stale retry rows are just left in "
+                              "place instead of cleaned up.")
     args = parser.parse_args()
 
     if args.from_date and not args.to_date:
@@ -232,6 +241,7 @@ def main():
     mode = "DRY RUN — no changes written" if dry_run else "APPLY"
     filter_label = f"sat_table={args.sat_table} ({len(meter_serials):,} meters)" if meter_serials else "all meters"
     hes_label = " | create-missing-hes=ON" if args.create_missing_hes else ""
+    hes_label += " | skip-retry-cleanup=ON" if args.skip_retry_cleanup else ""
     print(
         f"[Force Correct] Mode={mode} | target={args.target_seconds}s ({args.target_seconds//60} min) "
         f"| {len(dates)} date(s) | {filter_label} | all 5 commands eligible | no LDP check{hes_label}\n",
@@ -255,6 +265,7 @@ def main():
                 date_str, p_conn, m_conn, h_conn,
                 args.target_seconds, dry_run, meter_serials,
                 create_missing_hes=args.create_missing_hes,
+                skip_retry_cleanup=args.skip_retry_cleanup,
             )
             for k, v in stats.items():
                 totals[k] += v

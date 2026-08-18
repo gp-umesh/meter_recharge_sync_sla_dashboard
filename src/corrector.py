@@ -184,6 +184,7 @@ def apply_correction(
     dry_run: bool = True,
     eligible_command_names: list[str] | None = None,
     create_missing_hes: bool = False,
+    skip_retry_cleanup: bool = False,
 ) -> dict | None:
     selected = select_eligible_command(commands, seed=recharge['transaction_id'],
                                        eligible_command_names=eligible_command_names)
@@ -284,37 +285,46 @@ def apply_correction(
         # lookup/delete to a window around the recharge so Postgres can prune partitions
         # instead of probing all of them (retries land within mdmsAttemptDelayMinutes *
         # mdmsMaxAttempts of the original dispatch, so 1 day is a generous margin).
-        window_start = recharge_created_at - timedelta(hours=1)
-        window_end = recharge_created_at + timedelta(days=1)
-        cur.execute("""
-            SELECT execution_id FROM command_execution_info
-            WHERE batch_id = (
-                SELECT batch_id FROM command_execution_info
-                WHERE execution_id = %(selected_exec_id)s
+        #
+        # Caveat even with pruning: command_execution_info's own AFTER DELETE trigger
+        # (trg_delete_command_metadata) runs an EXISTS(...) check on
+        # command_execution_meta_data_id with NO index and NO created_at bound — on a
+        # ~409M-row table, deleting a retry row that's the sole reference to its metadata
+        # can turn into a multi-minute sequential scan we have no way to bound from here.
+        # skip_retry_cleanup avoids that entirely at the cost of leaving stale FAILED
+        # retry rows in place instead of deleting them.
+        if not skip_retry_cleanup:
+            window_start = recharge_created_at - timedelta(hours=1)
+            window_end = recharge_created_at + timedelta(days=1)
+            cur.execute("""
+                SELECT execution_id FROM command_execution_info
+                WHERE batch_id = (
+                    SELECT batch_id FROM command_execution_info
+                    WHERE execution_id = %(selected_exec_id)s
+                      AND created_at >= %(window_start)s AND created_at < %(window_end)s
+                )
+                  AND execution_id  != %(selected_exec_id)s
+                  AND execution_status = 'FAILED'
+                  AND start_time > %(end_time)s
                   AND created_at >= %(window_start)s AND created_at < %(window_end)s
-            )
-              AND execution_id  != %(selected_exec_id)s
-              AND execution_status = 'FAILED'
-              AND start_time > %(end_time)s
-              AND created_at >= %(window_start)s AND created_at < %(window_end)s
-        """, {
-            'selected_exec_id': selected_exec_id,
-            'window_start': window_start,
-            'window_end': window_end,
-            'end_time': end_time,
-        })
-        retry_ids = [str(row[0]) for row in cur.fetchall()]
+            """, {
+                'selected_exec_id': selected_exec_id,
+                'window_start': window_start,
+                'window_end': window_end,
+                'end_time': end_time,
+            })
+            retry_ids = [str(row[0]) for row in cur.fetchall()]
 
-        if retry_ids:
-            cur.execute("DELETE FROM command_execution_responses WHERE execution_id = ANY(%s)", (retry_ids,))
-            result['hes_retries_responses_deleted'] = cur.rowcount
-            cur.execute(
-                "DELETE FROM command_execution_info "
-                "WHERE execution_id = ANY(%(retry_ids)s) "
-                "AND created_at >= %(window_start)s AND created_at < %(window_end)s",
-                {'retry_ids': retry_ids, 'window_start': window_start, 'window_end': window_end},
-            )
-            result['hes_retries_executions_deleted'] = cur.rowcount
+            if retry_ids:
+                cur.execute("DELETE FROM command_execution_responses WHERE execution_id = ANY(%s)", (retry_ids,))
+                result['hes_retries_responses_deleted'] = cur.rowcount
+                cur.execute(
+                    "DELETE FROM command_execution_info "
+                    "WHERE execution_id = ANY(%(retry_ids)s) "
+                    "AND created_at >= %(window_start)s AND created_at < %(window_end)s",
+                    {'retry_ids': retry_ids, 'window_start': window_start, 'window_end': window_end},
+                )
+                result['hes_retries_executions_deleted'] = cur.rowcount
 
     # NOTE: callers are responsible for committing mdms_conn and hes_conn.
     # Batch callers should commit once after processing the full batch.
