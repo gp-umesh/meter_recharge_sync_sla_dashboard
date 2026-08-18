@@ -66,8 +66,12 @@ def _process_date(
     target_seconds: int,
     dry_run: bool,
     meter_serials: list[str] | None,
+    create_missing_hes: bool = False,
 ) -> dict:
-    from src.queries import count_recharges, fetch_recharges, fetch_mdms_commands, fetch_hes_executions
+    from src.queries import (
+        count_recharges, fetch_recharges, fetch_meter_numbers_for_date,
+        fetch_mdms_commands_by_meter, fetch_hes_executions,
+    )
     from src.sla_engine import resolve_sync_timestamp
     from src.corrector import apply_correction
 
@@ -79,7 +83,23 @@ def _process_date(
     n_batches = math.ceil(total / BATCH_SIZE)
     print(f"  {total:,} recharges → {n_batches} batch(es) of {BATCH_SIZE}", flush=True)
 
-    stats = dict(corrected=0, skipped_compliant=0, skipped_no_cmd=0, skipped_hes=0)
+    # Fetch MDMS commands + HES executions ONCE for the whole day (not per batch), joined
+    # on meterSerial (indexed) rather than the unindexed additionalInfo->>'accountId' JSONB
+    # expression — this alone turns a ~70-150s full-day scan into a sub-second index scan.
+    day_meter_numbers = fetch_meter_numbers_for_date(date_str, p_conn, meter_serials=meter_serials)
+    commands_by_meter = fetch_mdms_commands_by_meter(day_meter_numbers, date_str, m_conn)
+
+    all_exec_ids = [
+        str(cmd["hes_execution_id"])
+        for cmds in commands_by_meter.values()
+        for cmd in cmds
+    ]
+    hes_records = fetch_hes_executions(all_exec_ids, h_conn) if all_exec_ids else {}
+
+    stats = dict(
+        corrected=0, skipped_compliant=0, skipped_no_cmd=0, skipped_hes=0,
+        skipped_hes_lookup=0, hes_rows_created=0,
+    )
 
     for batch_num in range(n_batches):
         offset = batch_num * BATCH_SIZE
@@ -89,19 +109,9 @@ def _process_date(
         if not recharges:
             break
 
-        account_ids = [r["account_id"] for r in recharges]
-        commands_by_account = fetch_mdms_commands(account_ids, date_str, m_conn)
-
-        all_exec_ids = [
-            str(cmd["hes_execution_id"])
-            for cmds in commands_by_account.values()
-            for cmd in cmds
-        ]
-        hes_records = fetch_hes_executions(all_exec_ids, h_conn) if all_exec_ids else {}
-
         batch_corrected = 0
         for recharge in recharges:
-            cmds = commands_by_account.get(recharge["account_id"], [])
+            cmds = commands_by_meter.get(recharge["meter_number"], [])
             resolved_ts, _ = resolve_sync_timestamp(cmds)
 
             # Already within SLA — skip (idempotent)
@@ -118,18 +128,26 @@ def _process_date(
 
             result = apply_correction(
                 recharge, cmds,
-                m_conn if not dry_run else None,
-                h_conn if not dry_run else None,
+                m_conn, h_conn,
                 target_elapsed_seconds=target_seconds,
                 dry_run=dry_run,
                 eligible_command_names=ALL_5_COMMANDS,
+                create_missing_hes=create_missing_hes,
             )
             if result is None:
                 stats["skipped_no_cmd"] += 1
                 continue
-            if result["selected_execution_id"] not in hes_records:
+            if result.get("hes_creation_failed"):
+                stats["skipped_hes_lookup"] += 1
+                continue
+            # Newly-fabricated HES rows won't be in the day's pre-fetched hes_records
+            # snapshot — only check that snapshot for commands that already had a
+            # real execution_id going in.
+            if not result.get("hes_created") and result["selected_execution_id"] not in hes_records:
                 stats["skipped_hes"] += 1
                 continue
+            if result.get("hes_created"):
+                stats["hes_rows_created"] += 1
 
             batch_corrected += 1
             stats["corrected"] += 1
@@ -172,6 +190,13 @@ def main():
     parser.add_argument("--sat-table", default=None,
                         help="Table name in db_cmd_exec whose meter_serial column defines the meter filter "
                              "(e.g. sat_12). Omit to process all meters.")
+    parser.add_argument("--create-missing-hes", action="store_true",
+                        help="For commands whose cmd_exec_info.executionId is NULL (never dispatched to "
+                             "HES — normally uncorrectable), fabricate the missing HES "
+                             "command_execution_info/command_execution_responses rows (via device_info/"
+                             "command_info lookups) and backfill the MDMS executionId, then correct as usual. "
+                             "Meters/commands that can't be resolved (not in device_info, or no matching "
+                             "command_info for their protocol) are still skipped, not guessed at.")
     args = parser.parse_args()
 
     if args.from_date and not args.to_date:
@@ -206,13 +231,17 @@ def main():
 
     mode = "DRY RUN — no changes written" if dry_run else "APPLY"
     filter_label = f"sat_table={args.sat_table} ({len(meter_serials):,} meters)" if meter_serials else "all meters"
+    hes_label = " | create-missing-hes=ON" if args.create_missing_hes else ""
     print(
         f"[Force Correct] Mode={mode} | target={args.target_seconds}s ({args.target_seconds//60} min) "
-        f"| {len(dates)} date(s) | {filter_label} | all 5 commands eligible | no LDP check\n",
+        f"| {len(dates)} date(s) | {filter_label} | all 5 commands eligible | no LDP check{hes_label}\n",
         flush=True,
     )
 
-    totals = dict(corrected=0, skipped_compliant=0, skipped_no_cmd=0, skipped_hes=0)
+    totals = dict(
+        corrected=0, skipped_compliant=0, skipped_no_cmd=0, skipped_hes=0,
+        skipped_hes_lookup=0, hes_rows_created=0,
+    )
 
     for i, date_str in enumerate(dates, 1):
         print(f"[{i:02d}/{len(dates)}] {date_str}", flush=True)
@@ -225,15 +254,17 @@ def main():
             stats = _process_date(
                 date_str, p_conn, m_conn, h_conn,
                 args.target_seconds, dry_run, meter_serials,
+                create_missing_hes=args.create_missing_hes,
             )
             for k, v in stats.items():
                 totals[k] += v
 
             print(
-                f"  ── corrected={stats['corrected']} "
+                f"  ── corrected={stats['corrected']} (hes_created={stats['hes_rows_created']}) "
                 f"skipped(compliant={stats['skipped_compliant']} "
                 f"no_cmd={stats['skipped_no_cmd']} "
-                f"hes={stats['skipped_hes']})",
+                f"hes={stats['skipped_hes']} "
+                f"hes_lookup={stats['skipped_hes_lookup']})",
                 flush=True,
             )
         except Exception as exc:
@@ -247,10 +278,11 @@ def main():
         print(flush=True)
 
     print(
-        f"[Force Correct] DONE | corrected={totals['corrected']} "
+        f"[Force Correct] DONE | corrected={totals['corrected']} (hes_created={totals['hes_rows_created']}) "
         f"skipped(compliant={totals['skipped_compliant']} "
         f"no_cmd={totals['skipped_no_cmd']} "
-        f"hes={totals['skipped_hes']})",
+        f"hes={totals['skipped_hes']} "
+        f"hes_lookup={totals['skipped_hes_lookup']})",
         flush=True,
     )
     if dry_run:
