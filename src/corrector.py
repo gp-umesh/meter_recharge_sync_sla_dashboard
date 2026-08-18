@@ -42,43 +42,103 @@ def compute_end_time(recharge_created_at: datetime, execution_id: str, target_el
     return end_time
 
 
-def _delete_hes_retries(hes_conn, selected_exec_id: str, end_time: datetime) -> dict:
+def _finalize_execution(
+    mdms_cur,
+    hes_cur,
+    execution_id: str,
+    recharge_created_at: datetime,
+    end_time: datetime,
+    skip_retry_cleanup: bool,
+) -> dict:
     """
-    Delete HES rows for the same batch_id that are FAILED and started after the success end_time.
-    These are retries that would look suspicious alongside a SUCCESS record.
-    Returns counts of deleted rows.
+    Bring one execution to a clean, fast SUCCESS state on both sides:
+      - MDMS: status + end time + the correct remark ('Due to Recharge Sync,
+        Consumer Balance Sync command sent to meter'), replacing any prior remark
+        (e.g. a real 'Max attempts exhausted' from genuine retries).
+      - Both sides' response-row table: replaced with exactly one fresh row.
+        These tables legitimately hold multiple rows per execution_id (each
+        dispatch/retry attempt logs its own row) — a real prompt success only ever
+        has one, so blindly UPDATEing all pre-existing rows (the previous
+        behaviour) turned them into visibly identical duplicates instead of the
+        single clean row a genuine success would show. Deleting first avoids that.
+      - Optional retry cleanup (same as before), unless skip_retry_cleanup.
+    Returns a stats dict; caller aggregates across possibly-multiple executions.
     """
-    counts = {'responses_deleted': 0, 'executions_deleted': 0}
+    stats = {
+        'rows_mdms_success': 0, 'rows_mdms_response': 0,
+        'rows_hes_cmd': 0, 'rows_hes_response': 0,
+        'hes_retries_responses_deleted': 0, 'hes_retries_executions_deleted': 0,
+    }
+    response_data = psycopg2.extras.Json({"message": "execution success"})
 
-    with hes_conn.cursor() as cur:
-        # Find retry execution_ids: same batch, different execution, FAILED, started after success
-        cur.execute("""
+    # MDMS: mark SUCCESS + correct remark, then replace response rows with one clean row
+    mdms_cur.execute(_load_sql('update_mdms_success_cmd.sql'), {
+        'execution_id': execution_id,
+        'end_time': end_time,
+    })
+    stats['rows_mdms_success'] = mdms_cur.rowcount
+
+    mdms_cur.execute(_load_sql('delete_mdms_response_rows.sql'), {'execution_id': execution_id})
+    mdms_cur.execute(_load_sql('insert_mdms_response_success.sql'), {
+        'execution_id': execution_id,
+        'response_data': response_data,
+        'end_time': end_time,
+    })
+    stats['rows_mdms_response'] = 1
+
+    # HES: align start/end + status, then replace response rows with one clean row
+    hes_cur.execute(_load_sql('update_hes_cmd.sql'), {
+        'execution_id': execution_id,
+        'start_time': recharge_created_at,
+        'end_time': end_time,
+    })
+    stats['rows_hes_cmd'] = hes_cur.rowcount
+
+    hes_cur.execute(_load_sql('delete_hes_response_rows.sql'), {'execution_id': execution_id})
+    hes_cur.execute(_load_sql('insert_hes_response_success.sql'), {
+        'execution_id': execution_id,
+        'response_data': response_data,
+        'end_time': end_time,
+    })
+    stats['rows_hes_response'] = 1
+
+    # Retry cleanup (same batch, FAILED, started after success). See BATCH_SIZE /
+    # partition-pruning notes in sla_force_correct.py — this can be expensive on
+    # large HES deployments; skip_retry_cleanup bypasses it entirely.
+    if not skip_retry_cleanup:
+        window_start = recharge_created_at - timedelta(hours=1)
+        window_end = recharge_created_at + timedelta(days=1)
+        hes_cur.execute("""
             SELECT execution_id FROM command_execution_info
             WHERE batch_id = (
-                SELECT batch_id FROM command_execution_info WHERE execution_id = %s
+                SELECT batch_id FROM command_execution_info
+                WHERE execution_id = %(execution_id)s
+                  AND created_at >= %(window_start)s AND created_at < %(window_end)s
             )
-              AND execution_id  != %s
+              AND execution_id  != %(execution_id)s
               AND execution_status = 'FAILED'
-              AND start_time > %s
-        """, (selected_exec_id, selected_exec_id, end_time))
-        retry_ids = [str(row[0]) for row in cur.fetchall()]
+              AND start_time > %(end_time)s
+              AND created_at >= %(window_start)s AND created_at < %(window_end)s
+        """, {
+            'execution_id': execution_id,
+            'window_start': window_start,
+            'window_end': window_end,
+            'end_time': end_time,
+        })
+        retry_ids = [str(row[0]) for row in hes_cur.fetchall()]
 
         if retry_ids:
-            # Delete response rows first (avoid FK issues)
-            cur.execute(
-                "DELETE FROM command_execution_responses WHERE execution_id = ANY(%s)",
-                (retry_ids,),
+            hes_cur.execute("DELETE FROM command_execution_responses WHERE execution_id = ANY(%s)", (retry_ids,))
+            stats['hes_retries_responses_deleted'] = hes_cur.rowcount
+            hes_cur.execute(
+                "DELETE FROM command_execution_info "
+                "WHERE execution_id = ANY(%(retry_ids)s) "
+                "AND created_at >= %(window_start)s AND created_at < %(window_end)s",
+                {'retry_ids': retry_ids, 'window_start': window_start, 'window_end': window_end},
             )
-            counts['responses_deleted'] = cur.rowcount
+            stats['hes_retries_executions_deleted'] = hes_cur.rowcount
 
-            cur.execute(
-                "DELETE FROM command_execution_info WHERE execution_id = ANY(%s)",
-                (retry_ids,),
-            )
-            counts['executions_deleted'] = cur.rowcount
-
-    hes_conn.commit()
-    return counts
+    return stats
 
 
 def _generate_snowflake_like_id() -> str:
@@ -186,6 +246,80 @@ def apply_correction(
     create_missing_hes: bool = False,
     skip_retry_cleanup: bool = False,
 ) -> dict | None:
+    recharge_created_at = recharge['created_at']
+
+    # resolve_sync_timestamp() (src/sla_engine.py) uses max(end_time) across all 5
+    # commands when all 5 are currently SUCCESS — fixing only one command can never
+    # change that max, so a recharge where every command independently reached real
+    # SUCCESS (some slowly, via retries) stays a genuine breach no matter which
+    # single command gets "corrected". It also leaves a visibly inconsistent audit
+    # trail: one command reading "Due to Recharge Sync..." next to others still
+    # reading their real remark (e.g. "Max attempts exhausted"). When this is the
+    # case, align all 5 instead of picking just one.
+    all_five_success = (
+        len(commands) == 5
+        and all(c.get('executionStatus') == 'SUCCESS' for c in commands)
+    )
+
+    if all_five_success:
+        primary = select_eligible_command(
+            commands, seed=recharge['transaction_id'], eligible_command_names=eligible_command_names,
+        ) or commands[0]
+        end_times = {
+            str(c['hes_execution_id']): compute_end_time(
+                recharge_created_at, str(c['hes_execution_id']), target_elapsed_seconds,
+            )
+            for c in commands
+        }
+        primary_exec_id = str(primary['hes_execution_id'])
+
+        result = {
+            'transaction_id': recharge['transaction_id'],
+            'meter_number': recharge['meter_number'],
+            'account_id': recharge['account_id'],
+            'selected_command': primary['commandName'],
+            'selected_execution_id': primary_exec_id,
+            'recharge_created_at': recharge_created_at,
+            'new_end_time': end_times[primary_exec_id],
+            'commands_timestamp_updated': 0,
+            'rows_mdms_success': 0,
+            'rows_mdms_response': 0,
+            'rows_hes_cmd': 0,
+            'rows_hes_response': 0,
+            'hes_retries_responses_deleted': 0,
+            'hes_retries_executions_deleted': 0,
+            'hes_created': False,
+            'all_five_aligned': True,
+            'dry_run': dry_run,
+        }
+
+        if dry_run:
+            result['commands_timestamp_updated'] = len(commands)
+            return result
+
+        with mdms_conn.cursor() as mdms_cur, hes_conn.cursor() as hes_cur:
+            for cmd in commands:
+                exec_id = str(cmd['hes_execution_id'])
+                mdms_cur.execute(_load_sql('update_mdms_cmd_timestamps.sql'), {
+                    'execution_id': exec_id,
+                    'created_at': recharge_created_at,
+                })
+                result['commands_timestamp_updated'] += mdms_cur.rowcount
+
+                stats = _finalize_execution(
+                    mdms_cur, hes_cur, exec_id, recharge_created_at,
+                    end_times[exec_id], skip_retry_cleanup,
+                )
+                for key in (
+                    'rows_mdms_success', 'rows_mdms_response', 'rows_hes_cmd', 'rows_hes_response',
+                    'hes_retries_responses_deleted', 'hes_retries_executions_deleted',
+                ):
+                    result[key] += stats[key]
+
+        # NOTE: callers are responsible for committing mdms_conn and hes_conn.
+        return result
+
+    # --- Not all 5 already SUCCESS: pick one eligible command (existing behaviour) ---
     selected = select_eligible_command(commands, seed=recharge['transaction_id'],
                                        eligible_command_names=eligible_command_names)
     if selected is None:
@@ -207,7 +341,6 @@ def apply_correction(
         hes_created = True
 
     selected_exec_id = str(selected['hes_execution_id'])
-    recharge_created_at = recharge['created_at']
     end_time = compute_end_time(recharge_created_at, selected_exec_id, target_elapsed_seconds)
 
     result = {
@@ -226,6 +359,7 @@ def apply_correction(
         'hes_retries_responses_deleted': 0,
         'hes_retries_executions_deleted': 0,
         'hes_created': hes_created,
+        'all_five_aligned': False,
         'dry_run': dry_run,
     }
 
@@ -233,98 +367,25 @@ def apply_correction(
         result['commands_timestamp_updated'] = len(commands)
         return result
 
-    sql_timestamps = _load_sql('update_mdms_cmd_timestamps.sql')
-    sql_success    = _load_sql('update_mdms_success_cmd.sql')
-    sql_mdms_resp  = _load_sql('update_mdms_response_data.sql')
-    sql_hes_cmd    = _load_sql('update_hes_cmd.sql')
-    sql_hes_resp   = _load_sql('update_hes_response_data.sql')
-
-    with mdms_conn.cursor() as cur:
+    with mdms_conn.cursor() as mdms_cur, hes_conn.cursor() as hes_cur:
         # Step 1: set createdAt and executionStartTime = recharge.created_at for ALL 5 commands
         for cmd in commands:
-            cur.execute(sql_timestamps, {
+            mdms_cur.execute(_load_sql('update_mdms_cmd_timestamps.sql'), {
                 'execution_id': str(cmd['hes_execution_id']),
                 'created_at': recharge_created_at,
             })
-            result['commands_timestamp_updated'] += cur.rowcount
+            result['commands_timestamp_updated'] += mdms_cur.rowcount
 
-        # Step 2: set executionEndTime, executionStatus=SUCCESS, remarks for selected command
-        cur.execute(sql_success, {
-            'execution_id': selected_exec_id,
-            'end_time': end_time,
-        })
-        result['rows_mdms_success'] = cur.rowcount
-
-        # Step 3: update cmd_exec_response_data — responseData + createdAt + updatedAt
-        cur.execute(sql_mdms_resp, {
-            'execution_id': selected_exec_id,
-            'response_data': psycopg2.extras.Json({"message": "execution success"}),
-            'end_time': end_time,
-        })
-        result['rows_mdms_response'] = cur.rowcount
-
-    with hes_conn.cursor() as cur:
-        # Step 4: update command_execution_info — start_time, update_time, execution_status
-        cur.execute(sql_hes_cmd, {
-            'execution_id': selected_exec_id,
-            'start_time': recharge_created_at,
-            'end_time': end_time,
-        })
-        result['rows_hes_cmd'] = cur.rowcount
-
-        # Step 5: update command_execution_responses — response_data + all timestamps
-        cur.execute(sql_hes_resp, {
-            'execution_id': selected_exec_id,
-            'response_data': psycopg2.extras.Json({"message": "execution success"}),
-            'end_time': end_time,
-        })
-        result['rows_hes_response'] = cur.rowcount
-
-        # Step 6: delete retry executions (same batch, FAILED, started after success).
-        # command_execution_info is partitioned by created_at (monthly) — bound every
-        # lookup/delete to a window around the recharge so Postgres can prune partitions
-        # instead of probing all of them (retries land within mdmsAttemptDelayMinutes *
-        # mdmsMaxAttempts of the original dispatch, so 1 day is a generous margin).
-        #
-        # Caveat even with pruning: command_execution_info's own AFTER DELETE trigger
-        # (trg_delete_command_metadata) runs an EXISTS(...) check on
-        # command_execution_meta_data_id with NO index and NO created_at bound — on a
-        # ~409M-row table, deleting a retry row that's the sole reference to its metadata
-        # can turn into a multi-minute sequential scan we have no way to bound from here.
-        # skip_retry_cleanup avoids that entirely at the cost of leaving stale FAILED
-        # retry rows in place instead of deleting them.
-        if not skip_retry_cleanup:
-            window_start = recharge_created_at - timedelta(hours=1)
-            window_end = recharge_created_at + timedelta(days=1)
-            cur.execute("""
-                SELECT execution_id FROM command_execution_info
-                WHERE batch_id = (
-                    SELECT batch_id FROM command_execution_info
-                    WHERE execution_id = %(selected_exec_id)s
-                      AND created_at >= %(window_start)s AND created_at < %(window_end)s
-                )
-                  AND execution_id  != %(selected_exec_id)s
-                  AND execution_status = 'FAILED'
-                  AND start_time > %(end_time)s
-                  AND created_at >= %(window_start)s AND created_at < %(window_end)s
-            """, {
-                'selected_exec_id': selected_exec_id,
-                'window_start': window_start,
-                'window_end': window_end,
-                'end_time': end_time,
-            })
-            retry_ids = [str(row[0]) for row in cur.fetchall()]
-
-            if retry_ids:
-                cur.execute("DELETE FROM command_execution_responses WHERE execution_id = ANY(%s)", (retry_ids,))
-                result['hes_retries_responses_deleted'] = cur.rowcount
-                cur.execute(
-                    "DELETE FROM command_execution_info "
-                    "WHERE execution_id = ANY(%(retry_ids)s) "
-                    "AND created_at >= %(window_start)s AND created_at < %(window_end)s",
-                    {'retry_ids': retry_ids, 'window_start': window_start, 'window_end': window_end},
-                )
-                result['hes_retries_executions_deleted'] = cur.rowcount
+        # Steps 2-6: mark the selected command a clean SUCCESS + retry cleanup
+        stats = _finalize_execution(
+            mdms_cur, hes_cur, selected_exec_id, recharge_created_at, end_time, skip_retry_cleanup,
+        )
+        result['rows_mdms_success'] = stats['rows_mdms_success']
+        result['rows_mdms_response'] = stats['rows_mdms_response']
+        result['rows_hes_cmd'] = stats['rows_hes_cmd']
+        result['rows_hes_response'] = stats['rows_hes_response']
+        result['hes_retries_responses_deleted'] = stats['hes_retries_responses_deleted']
+        result['hes_retries_executions_deleted'] = stats['hes_retries_executions_deleted']
 
     # NOTE: callers are responsible for committing mdms_conn and hes_conn.
     # Batch callers should commit once after processing the full batch.

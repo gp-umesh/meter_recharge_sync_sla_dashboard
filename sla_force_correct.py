@@ -9,6 +9,12 @@ Differences from sla_correct.py:
   - Supports a single --date or a date range via --from-date / --to-date
   - Optional --sat-table to restrict processing to meters in a named table in db_cmd_exec
   - Processes in batches of BATCH_SIZE to avoid memory issues on large dates
+  - Optional --create-missing-hes: fabricates the HES rows for commands whose
+    cmd_exec_info.executionId is NULL (never dispatched to HES — previously
+    uncorrectable). See specs/001-sla-dashboard-correction/research.md R-11.
+  - Optional --skip-retry-cleanup: skips deleting stale FAILED HES retry rows after a
+    correction, to avoid an unindexed trigger-driven scan on large command_execution_info
+    tables that can stall or drop the DB connection. See research.md R-12.
 
 Usage:
   python sla_force_correct.py --date 2026-05-12                                      # dry-run, all meters
@@ -16,6 +22,8 @@ Usage:
   python sla_force_correct.py --from-date 2026-04-15 --to-date 2026-05-14 --no-dry-run
   python sla_force_correct.py --from-date 2026-04-15 --to-date 2026-05-14 \\
       --sat-table sat_12 --no-dry-run                                                 # only sat_12 meters
+  python sla_force_correct.py --from-date 2026-04-15 --to-date 2026-05-14 \\
+      --sat-table sat_12 --create-missing-hes --skip-retry-cleanup --no-dry-run
 """
 import math
 import os
@@ -79,7 +87,10 @@ def _process_date(
     total = count_recharges(date_str, p_conn, meter_serials=meter_serials)
     if total == 0:
         print(f"  No recharges — skipping", flush=True)
-        return dict(corrected=0, skipped_compliant=0, skipped_no_cmd=0, skipped_hes=0)
+        return dict(
+            corrected=0, skipped_compliant=0, skipped_no_cmd=0, skipped_hes=0,
+            skipped_hes_lookup=0, hes_rows_created=0, all_five_aligned=0,
+        )
 
     n_batches = math.ceil(total / BATCH_SIZE)
     print(f"  {total:,} recharges → {n_batches} batch(es) of {BATCH_SIZE}", flush=True)
@@ -99,7 +110,7 @@ def _process_date(
 
     stats = dict(
         corrected=0, skipped_compliant=0, skipped_no_cmd=0, skipped_hes=0,
-        skipped_hes_lookup=0, hes_rows_created=0,
+        skipped_hes_lookup=0, hes_rows_created=0, all_five_aligned=0,
     )
 
     for batch_num in range(n_batches):
@@ -150,6 +161,8 @@ def _process_date(
                 continue
             if result.get("hes_created"):
                 stats["hes_rows_created"] += 1
+            if result.get("all_five_aligned"):
+                stats["all_five_aligned"] += 1
 
             batch_corrected += 1
             stats["corrected"] += 1
@@ -250,7 +263,7 @@ def main():
 
     totals = dict(
         corrected=0, skipped_compliant=0, skipped_no_cmd=0, skipped_hes=0,
-        skipped_hes_lookup=0, hes_rows_created=0,
+        skipped_hes_lookup=0, hes_rows_created=0, all_five_aligned=0,
     )
 
     for i, date_str in enumerate(dates, 1):
@@ -271,7 +284,8 @@ def main():
                 totals[k] += v
 
             print(
-                f"  ── corrected={stats['corrected']} (hes_created={stats['hes_rows_created']}) "
+                f"  ── corrected={stats['corrected']} "
+                f"(hes_created={stats['hes_rows_created']} all_five_aligned={stats['all_five_aligned']}) "
                 f"skipped(compliant={stats['skipped_compliant']} "
                 f"no_cmd={stats['skipped_no_cmd']} "
                 f"hes={stats['skipped_hes']} "
@@ -289,7 +303,8 @@ def main():
         print(flush=True)
 
     print(
-        f"[Force Correct] DONE | corrected={totals['corrected']} (hes_created={totals['hes_rows_created']}) "
+        f"[Force Correct] DONE | corrected={totals['corrected']} "
+        f"(hes_created={totals['hes_rows_created']} all_five_aligned={totals['all_five_aligned']}) "
         f"skipped(compliant={totals['skipped_compliant']} "
         f"no_cmd={totals['skipped_no_cmd']} "
         f"hes={totals['skipped_hes']} "
