@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BATCH_SIZE = 100
+BATCH_SIZE = 20
 
 # All 5 commands are eligible (no restriction to 3 like sla_correct.py)
 ALL_5_COMMANDS = [
